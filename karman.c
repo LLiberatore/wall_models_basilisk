@@ -1,5 +1,5 @@
 #include "grid/octree.h"
-#include "embed.h"
+#include "embed_Luca.h"
 #include "navier-stokes/centered.h"
 #include "tracer.h"
 #include "view.h"
@@ -54,6 +54,10 @@ u.t[embed] = dirichlet(0.);
 u.r[embed] = dirichlet(0.);
  
 event init (t = 0){
+  // wall model di Spalding sul bordo embedded (viscosita' assunta 1/Reynolds)
+  spalding_u = u;
+  foreach_dimension()
+    u.x.spalding = true;
   refine (fabs(sqrt(sq(x - xc) + sq(y - yc) + sq(z - zc)) - D/2.) < 0.15*D &&
           level < local_maxlevel(x, y, z));
   solid (cs, fs, sqrt(sq(x - xc) + sq(y - yc) + sq(z - zc)) - D/2.);
