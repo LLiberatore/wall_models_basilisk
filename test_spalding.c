@@ -44,7 +44,7 @@ event init (t = 0)
   int fail = 0;
   for (int a = 0; a < 3; a++) {
     double th = angles[a]*M_PI/180.;
-    coord nf = {sin(th), cos(th)}, t = {cos(th), - sin(th)}; // nf: towards the fluid
+    coord nf = {sin(th), cos(th)}, tg = {cos(th), - sin(th)}; // nf: towards the fluid
     solid (cs, fs, (x - 0.5)*nf.x + (y - 0.3)*nf.y);
     foreach_face()
       muv.x[] = fm.x[]*nu;
@@ -52,7 +52,7 @@ event init (t = 0)
       if (cs[] > 0.) {
 	double d = max ((x - 0.5)*nf.x + (y - 0.3)*nf.y, 0.);
 	double ut = utau*uplus (d*utau/nu);
-	u.x[] = ut*t.x, u.y[] = ut*t.y;
+	u.x[] = ut*tg.x, u.y[] = ut*tg.y;
       }
       else
 	u.x[] = u.y[] = 0.;
