@@ -176,21 +176,20 @@ third-order accuracy when using Dirichlet conditions, see
 
 attribute {
   bool third;
-  bool spalding; // wall model (Spalding's law) on the embedded boundary
+  bool spalding; // wall model: scale the viscosity by *wmr* on embedded walls
 }
 
 /**
-## Wall model parameters
+## Wall model
 
-When the `spalding` attribute of a velocity component is `true`, the
-viscous flux through the embedded boundary is computed using Spalding's
-law of the wall (see *spalding_gradient()* below). The model needs the
-whole velocity vector, which must be set by the user (e.g. in the
-`init` event) with `spalding_u = u;`. The density is assumed to be
-unity. */
+When the `spalding` attribute of the velocity components is `true`, the
+viscosity used for the viscous flux through the embedded boundary is
+multiplied by the ratio *wmr* between the effective wall viscosity
+(given by Spalding's law, see *spalding_update()* below) and the
+standard viscosity. *wmr* is computed once per timestep on the finest
+grid and is equal to unity everywhere else. */
 
-vector spalding_u;
-double spalding_kappa = 0.41, spalding_B = 5.5;
+scalar wmr[];
 
 #undef face_gradient_x
 #define face_gradient_x(a,i)					\
@@ -475,106 +474,150 @@ double dirichlet_gradient (Point point, scalar s, scalar cs,
 bid embed;
 
 /**
-## Spalding wall model
+## Spalding's law of the wall (2D)
 
-Spalding's law of the wall gives, implicitly, the friction velocity
-$u_\tau$ as a function of the distance $d$ from the wall and of the
-tangential velocity $U$ at this distance
+The friction velocity $u_\tau$ is the positive root of
 $$
-y^+ = u^+ + \frac{1}{E}\left[e^{\kappa u^+} - 1 - \kappa u^+ -
-\frac{(\kappa u^+)^2}{2} - \frac{(\kappa u^+)^3}{6}\right]
+R(u_\tau) = \frac{y_p u_\tau}{\nu} - F\left(\frac{u_p}{u_\tau}\right) = 0
 $$
-with $y^+ = d u_\tau/\nu$, $u^+ = U/u_\tau$ and $E = e^{\kappa B}$.
-The residual below is monotonically decreasing in $u_\tau$ so we solve
-the law by bisection. */
+with $F(u^+) = u^+ + e^{-\kappa B}\left[e^{\kappa u^+} - 1 - \kappa u^+
+- (\kappa u^+)^2/2 - (\kappa u^+)^3/6\right]$, $u_p$ the tangential
+velocity sampled at the wall-normal distance $y_p$ and $\nu$ the
+*molecular* kinematic viscosity *spalding_nu* (to be set by the
+user). Since $u_\tau = u_p/u^+$ this is equivalent to $G(u^+) = u^+
+F(u^+) - Re = 0$, with $Re = u_p y_p/\nu$. $G$ is convex and
+increasing, so Newton's method started from the upper bound $\sqrt{Re}$
+converges monotonically. */
 
-static double spalding_residual (double ut, double U, double d, double nu)
+double spalding_nu = 0., spalding_kappa = 0.41, spalding_B = 5.5;
+double spalding_rmax = 1e3; // maximum value of the viscosity ratio
+
+static double spalding_utau (double up, double yp)
 {
-  double E = exp (spalding_kappa*spalding_B);
-  double up = U/ut, k = spalding_kappa*up;
-  return up + (exp (k) - 1. - k - k*k/2. - k*k*k/6.)/E - d*ut/nu;
+  if (up < 1e-12)
+    return 0.;
+  double Re = up*yp/spalding_nu, E = exp (- spalding_kappa*spalding_B);
+  double u = min (sqrt (Re), 60.); // avoids overflow of the exponential
+  for (int it = 0; it < 100; it++) {
+    double k = spalding_kappa*u, e = exp (k) - 1. - k - k*k/2.;
+    double G = u*(u + E*(e - k*k*k/6.)) - Re;
+    double dG = 2.*u + E*(e - k*k*k/6. + u*spalding_kappa*e);
+    double du = G/dG;
+    u -= du;
+    if (fabs (du) < 1e-10*u)
+      break;
+  }
+  return up/u;
 }
 
-static double spalding_utau (double U, double d, double nu)
+#if dimension == 2
+
+/**
+### Sampling of the velocity
+
+A ray is cast from the barycentre *p* of the embedded fragment along
+the direction $-\mathbf{n}$ (towards the fluid), exactly as done by
+*dirichlet_gradient()*. The intersection of the ray with the grid
+lines through the neighbouring cell centres gives the wall-normal
+distance $y_p = d_0\Delta$; the velocity is interpolated there with a
+parabolic interpolation and its tangential part gives $u_p$. The
+function returns *false* if the stencil is not entirely fluid. */
+
+foreach_dimension()
+static inline bool spalding_inputs_x (Point point, vector u, coord n, coord p,
+				      double * yp, double * up)
 {
-  double lo = 1e-12, hi = max (U, sqrt (nu*U/d));
-  while (spalding_residual (hi, U, d, nu) > 0.)
-    hi *= 2.;
-  for (int i = 0; i < 60; i++) {
-    double mid = (lo + hi)/2.;
-    if (spalding_residual (mid, U, d, nu) > 0.)
-      lo = mid;
-    else
-      hi = mid;
-  }
-  return (lo + hi)/2.;
+  foreach_dimension()
+    n.x = - n.x;
+  bool defined = true;
+  foreach_dimension()
+    if (defined && !fs.x[(n.x > 0.)])
+      defined = false;
+  if (!defined)
+    return false;
+  int i = sign(n.x);
+  double d0 = (i - p.x)/n.x, y1 = p.y + d0*n.y;
+  int j = y1 > 0.5 ? 1 : y1 < -0.5 ? -1 : 0;
+  y1 -= j;
+  if (!(fs.x[i + (i < 0),j] && fs.y[i,j] && fs.y[i,j+1] &&
+	cs[i,j-1] && cs[i,j] && cs[i,j+1]))
+    return false;
+  double ux = quadratic (y1, (u.x[i,j-1]), (u.x[i,j]), (u.x[i,j+1]));
+  double uy = quadratic (y1, (u.y[i,j-1]), (u.y[i,j]), (u.y[i,j+1]));
+  double un = ux*n.x + uy*n.y;
+  *yp = d0*Delta;
+  *up = sqrt (sq(ux - un*n.x) + sq(uy - un*n.y));
+  return true;
+}
+
+static inline bool spalding_inputs (Point point, vector u, coord n, coord p,
+				    double * yp, double * up)
+{
+  foreach_dimension()
+    if (fabs(n.x) >= fabs(n.y))
+      return spalding_inputs_x (point, u, n, p, yp, up);
+  return false;
 }
 
 /**
-This function returns the component *s* of the wall-normal gradient of
-the velocity vector *spalding_u* which is consistent with the wall
-shear stress of Spalding's law. *grad* is the standard (laminar)
-gradient, *mu* the dynamic viscosity.
+### Wall viscosity ratio
 
-The calculation proceeds as follows:
+For each cell cut by the embedded boundary we compute $y_p$, $u_p$,
+$u_\tau$ and $\tau_w = \rho u_\tau^2$ ($\rho$ is the local density
+without the metric factor). The numerical wall-normal velocity
+gradient $\mathbf{g}$ is computed at the barycentre with
+*dirichlet_gradient()*, and its tangential part $G_t = |\mathbf{g} -
+(\mathbf{g}\cdot\mathbf{n})\mathbf{n}|$ is used to define the
+effective viscosity $\mu_w = \tau_w/G_t$ (bounded below by $\rho\nu$).
+The ratio $\mu_w/\mu$, bounded by *spalding_rmax*, is stored in
+*wmr*. This function must be called once per timestep, before the
+viscous term, with the boundary conditions on *u* applied. */
 
-1. $Q$ is the projection of the cell center $C$ on the embedded
-fragment: in units of the cell size its coordinates are $\mathbf{q}
-= (\mathbf{p}\cdot\mathbf{n})\mathbf{n}$ with $\mathbf{p}$ the
-barycenter of the fragment, and the distance from the wall is $d =
-|\mathbf{p}\cdot\mathbf{n}|\Delta$;
-2. the velocity gradient $\mathbf{g}$ is computed at $Q$ (not at $p$)
-using *dirichlet_gradient()*, and its tangential part is $\mathbf{g}_t
-= \mathbf{g} - (\mathbf{g}\cdot\mathbf{n})\mathbf{n}$;
-3. the tangential velocity at distance $d$ is estimated as $U =
-|\mathbf{g}_t| d$ and Spalding's law gives $u_\tau$ and the wall shear
-stress $\tau_w = u_\tau^2$;
-4. the tangential gradient is rescaled so that $\mu\,\mathbf{g}_t^{eff} =
-\tau_w \mathbf{g}_t/|\mathbf{g}_t|$, the normal part is unchanged. */
-
-static double spalding_gradient (Point point, scalar s, coord n, coord p,
-				 double mu, double grad)
+void spalding_update (vector u, face vector mu, scalar rho)
 {
-  double pn = p.x*n.x + p.y*n.y + p.z*n.z;
-  coord q = {0};
-  foreach_dimension()
-    q.x = pn*n.x;
-  double d = max (fabs (pn), 1e-3)*Delta;
-
-  coord g = {0};
-  foreach_dimension() {
-    bool dirichlet = false;
-    double vb = spalding_u.x.boundary[embed] (point, point, spalding_u.x,
-					      &dirichlet);
-    if (dirichlet) {
-      double coef = 0.;
-      g.x = dirichlet_gradient (point, spalding_u.x, cs, n, q, vb, &coef);
-      if (g.x == nodata || coef)
-	return grad;
+  if (!u.x.spalding)
+    return;
+  assert (spalding_nu > 0.);
+  boundary ((scalar *){u});
+  foreach() {
+    wmr[] = 1.;
+    if (cs[] > 0. && cs[] < 1.) {
+      coord n, p;
+      embed_geometry (point, &p, &n);
+      double yp, up;
+      if (spalding_inputs (point, u, n, p, &yp, &up)) {
+	double ut = spalding_utau (up, yp);
+	coord g;
+	foreach_dimension() {
+	  double c = 0.;
+	  g.x = dirichlet_gradient (point, u.x, cs, n, p, 0., &c) + c*u.x[];
+	}
+	double gn = g.x*n.x + g.y*n.y;
+	double Gt = sqrt (sq(g.x - gn*n.x) + sq(g.y - gn*n.y));
+	if (ut > 0. && Gt > 1e-12) {
+	  double mua = 0., fa = 0.;
+	  foreach_dimension() {
+	    mua += mu.x[] + mu.x[1];
+	    fa  += fm.x[] + fm.x[1];
+	  }
+	  double rhol = rho[]/(cm[] + SEPS);
+	  double muw = max (rhol*sq(ut)/Gt, rhol*spalding_nu);
+	  wmr[] = min (muw/(mua/(fa + SEPS)), spalding_rmax);
+	}
+      }
     }
-    else
-      g.x = vb;
   }
-
-  double gn = 0.;
-  foreach_dimension()
-    gn += g.x*n.x;
-  coord gt = {0};
-  foreach_dimension()
-    gt.x = g.x - gn*n.x;
-  double gtm = sqrt (sq(gt.x) + sq(gt.y) + sq(gt.z));
-  if (gtm < 1e-30)
-    return grad;
-
-  double ut = spalding_utau (gtm*d, d, mu), scale = sq(ut)/(mu*gtm);
-  coord geff = {0};
-  foreach_dimension()
-    geff.x = scale*gt.x + gn*n.x;
-  foreach_dimension()
-    if (s.i == spalding_u.x.i)
-      return geff.x;
-  return grad;
+  restriction ({wmr});
 }
+
+#else // dimension != 2
+
+void spalding_update (vector u, face vector mu, scalar rho)
+{
+  assert (dimension == 2);
+}
+
+#endif // dimension != 2
 
 /**
 ## Surface force and vorticity
@@ -654,6 +697,8 @@ void embed_force (scalar p, vector u, face vector mu, coord * Fp, coord * Fmu)
 	  fa  += fm.x[] + fm.x[1];
 	}
 	mua /= fa;
+	if (u.x.spalding)
+	  mua *= wmr[];
 
 	/**
 	To compute the viscous force, we need to take into account the
@@ -817,18 +862,12 @@ double embed_flux (Point point, scalar s, face vector mu, double * val)
     fa  += fm.x[] + fm.x[1];
   }
 
-  double muwall = mua/(fa + SEPS);
+  double muw = mua/(fa + SEPS);
+  if (s.spalding)
+    muw *= wmr[];
 
-  /**
-  With the wall model, the Dirichlet gradient is replaced by the one
-  consistent with the wall shear stress given by Spalding's law. This
-  is not done in degenerate cases (`coef != 0`). */
-
-  if (dirichlet && s.spalding && !coef)
-    grad = spalding_gradient (point, s, n, p, muwall, grad);
-
-  *val = - muwall*grad*area/Delta;
-  return - muwall*coef*area/Delta;
+  *val = - muw*grad*area/Delta;
+  return - muw*coef*area/Delta;
 }
 
 /**
@@ -1040,6 +1079,8 @@ event metric (i = 0)
   }
   foreach()
     cs[] = 1.;
+  foreach()
+    wmr[] = 1.;
 
 #if TREE
   cs.refine = embed_fraction_refine;
@@ -1062,7 +1103,7 @@ event metric (i = 0)
   component. */
 
 #endif
-  restriction ({cs, fs});
+  restriction ({cs, fs, wmr});
 }
 
 /**
